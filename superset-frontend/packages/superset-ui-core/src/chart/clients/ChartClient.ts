@@ -46,9 +46,9 @@ interface AnnotationData {
   [key: string]: PlainObject;
 }
 
-type AnnotationQueryFormData = Partial<QueryFormData> & {
+type AnnotationQueryFormData = PlainObject & {
   annotation_layers?: AnnotationLayerMetadata[];
-} & PlainObject;
+};
 
 export interface ChartData {
   annotationData: AnnotationData;
