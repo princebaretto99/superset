@@ -31,6 +31,12 @@ cover
 .DS_Store
 .eggs
 .env
+devin-remediation/.env
+devin-remediation/.venv/
+devin-remediation/out/
+devin-remediation/__pycache__/
+devin-remediation/*.pyc
+devin-remediation/.pytest_cache/
 .envrc
 .idea
 .roo
