@@ -8,7 +8,7 @@ name: Devin Issue Remediation
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   repository_dispatch:
     types: [issue-event]
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
       dry_run:
         description: "Print the Devin API calls instead of making them"
         required: false
-        default: true
+        default: false
         type: boolean
 
 # Never let two runs work on the same issue at the same time.
