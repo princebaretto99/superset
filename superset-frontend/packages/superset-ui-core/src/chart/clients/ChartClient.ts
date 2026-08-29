@@ -25,6 +25,7 @@ import {
   SupersetClientClass,
   QueryFormData,
   Datasource,
+  buildQueryContext,
 } from '../..';
 import getChartBuildQueryRegistry from '../registries/ChartBuildQueryRegistrySingleton';
 import getChartMetadataRegistry from '../registries/ChartMetadataRegistrySingleton';
@@ -44,6 +45,10 @@ export type SliceIdAndOrFormData = AtLeastOne<{
 interface AnnotationData {
   [key: string]: PlainObject;
 }
+
+type AnnotationQueryFormData = PlainObject & {
+  annotation_layers?: AnnotationLayerMetadata[];
+};
 
 export interface ChartData {
   annotationData: AnnotationData;
@@ -134,25 +139,97 @@ export default class ChartClient {
       .then(response => response.json as Datasource);
   }
 
-  // eslint-disable-next-line class-methods-use-this
-  loadAnnotation(
+  async loadAnnotation(
     annotationLayer: AnnotationLayerMetadata,
+    formData: AnnotationQueryFormData = {},
+    options?: Partial<RequestConfig>,
   ): Promise<AnnotationData> {
     /* When annotation does not require query */
     if (!isDefined(annotationLayer.sourceType)) {
-      return Promise.resolve({} as AnnotationData);
+      return {} as AnnotationData;
     }
 
-    // TODO: Implement
-    return Promise.reject(new Error('This feature is not implemented yet.'));
+    /* Make a copy of formData, the caller's metadata is never mutated */
+    const annotationFormData: AnnotationQueryFormData = { ...formData };
+
+    /*
+     * In the original formData the `granularity` attribute represents the time
+     * grain (eg `P1D`), but in the request payload it corresponds to the name of
+     * the column where the time grain should be applied (eg `Date`), so things
+     * need to be moved around.
+     */
+    annotationFormData.time_grain_sqla =
+      annotationFormData.time_grain_sqla || annotationFormData.granularity;
+    annotationFormData.granularity = annotationFormData.granularity_sqla;
+
+    const overrides: PlainObject = { ...annotationLayer.overrides };
+    if ('since' in overrides || 'until' in overrides) {
+      overrides.time_range = null;
+    }
+    const layerOverrides = Object.keys(overrides).reduce(
+      (prev, key) => ({
+        ...prev,
+        [key]: overrides[key] || annotationFormData[key],
+      }),
+      {} as PlainObject,
+    );
+
+    if (Array.isArray(annotationFormData.annotation_layers)) {
+      annotationFormData.annotation_layers =
+        annotationFormData.annotation_layers.map(layer =>
+          layer.name === annotationLayer.name
+            ? { ...layer, overrides: layerOverrides }
+            : layer,
+        );
+    }
+
+    const buildQuery =
+      (await getChartBuildQueryRegistry().get(
+        annotationFormData.viz_type as string,
+      )) ??
+      ((queryFormData: QueryFormData) =>
+        buildQueryContext(queryFormData, baseQueryObject => [
+          { ...baseQueryObject },
+        ]));
+
+    const jsonPayload = buildQuery({
+      ...annotationFormData,
+      result_format: 'json',
+      result_type: 'full',
+    } as QueryFormData);
+
+    const response = await this.client.post({
+      endpoint: '/api/v1/chart/data',
+      jsonPayload,
+      ...options,
+    } as RequestConfig);
+
+    const { result } = response.json as {
+      result?: { annotation_data?: AnnotationData }[];
+    };
+    const annotationData = result?.[0]?.annotation_data?.[
+      annotationLayer.name
+    ] as AnnotationData | undefined;
+
+    if (!isDefined(annotationData)) {
+      throw new Error(
+        `Failed to load annotation data for layer: ${annotationLayer.name}`,
+      );
+    }
+
+    return annotationData;
   }
 
   loadAnnotations(
     annotationLayers?: AnnotationLayerMetadata[],
+    formData?: AnnotationQueryFormData,
+    options?: Partial<RequestConfig>,
   ): Promise<AnnotationData> {
     if (Array.isArray(annotationLayers) && annotationLayers.length > 0) {
       return Promise.all(
-        annotationLayers.map(layer => this.loadAnnotation(layer)),
+        annotationLayers.map(layer =>
+          this.loadAnnotation(layer, formData, options),
+        ),
       ).then(results =>
         annotationLayers.reduce((prev, layer, i) => {
           const output: AnnotationData = prev;
@@ -175,7 +252,7 @@ export default class ChartClient {
         },
       ) =>
         Promise.all([
-          this.loadAnnotations(formData.annotation_layers),
+          this.loadAnnotations(formData.annotation_layers, formData),
           this.loadDatasource(formData.datasource),
           this.loadQueryData(formData),
         ]).then(([annotationData, datasource, queriesData]) => ({

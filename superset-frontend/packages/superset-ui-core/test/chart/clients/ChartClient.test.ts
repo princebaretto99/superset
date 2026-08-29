@@ -197,13 +197,116 @@ describe('ChartClient', () => {
           name: 'my-annotation',
         }),
       ).resolves.toEqual({}));
-    test('otherwise returns a rejected promise because it is not implemented yet', () =>
+    test('queries the chart data endpoint and returns the annotation data', async () => {
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        result: [
+          {
+            annotation_data: {
+              'my-annotation': { records: [{ y: 1 }] },
+            },
+          },
+        ],
+      });
+
+      await expect(
+        chartClient.loadAnnotation(
+          {
+            name: 'my-annotation',
+            sourceType: 'line',
+            value: 1,
+            overrides: { since: '100 years ago' },
+          },
+          {
+            datasource: '1__table',
+            viz_type: VizType.Line,
+            granularity: 'P1D',
+            granularity_sqla: 'ds',
+            annotation_layers: [{ name: 'my-annotation', sourceType: 'line' }],
+          },
+        ),
+      ).resolves.toEqual({ records: [{ y: 1 }] });
+
+      const calls = fetchMock.callHistory.calls('glob:*/api/v1/chart/data');
+      const requestBody = JSON.parse(
+        (calls[0].options as RequestInit).body as string,
+      );
+      expect(requestBody.result_type).toEqual('full');
+      // `granularity` in form data is the time grain, but the payload expects
+      // it to be the time column
+      expect(requestBody.queries[0].granularity).toEqual('ds');
+      expect(requestBody.queries[0].extras.time_grain_sqla).toEqual('P1D');
       expect(
-        chartClient.loadAnnotation({
-          name: 'my-annotation',
-          sourceType: 'abc',
-        }),
-      ).rejects.toEqual(new Error('This feature is not implemented yet.')));
+        requestBody.queries[0].annotation_layers[0].overrides,
+      ).toStrictEqual({
+        since: '100 years ago',
+      });
+    });
+
+    test('does not mutate the annotation layer metadata', async () => {
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        result: [{ annotation_data: { 'my-annotation': {} } }],
+      });
+
+      const annotationLayer = {
+        name: 'my-annotation',
+        sourceType: 'line',
+        value: 1,
+        overrides: { since: '100 years ago' },
+      };
+      const formData = {
+        datasource: '1__table',
+        viz_type: VizType.Line,
+        annotation_layers: [{ name: 'my-annotation', sourceType: 'line' }],
+      };
+
+      await chartClient.loadAnnotation(annotationLayer, formData);
+
+      expect(annotationLayer.overrides).toStrictEqual({
+        since: '100 years ago',
+      });
+      expect(formData.annotation_layers[0]).toStrictEqual({
+        name: 'my-annotation',
+        sourceType: 'line',
+      });
+    });
+
+    test('rejects when the request fails', () => {
+      fetchMock.post('glob:*/api/v1/chart/data', 500);
+
+      return expect(
+        chartClient.loadAnnotation(
+          { name: 'my-annotation', sourceType: 'line', value: 1 },
+          { datasource: '1__table', viz_type: VizType.Line },
+        ),
+      ).rejects.toBeDefined();
+    });
+
+    test('rejects when the request times out', () => {
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        throws: { statusText: 'timeout' },
+      });
+
+      return expect(
+        chartClient.loadAnnotation(
+          { name: 'my-annotation', sourceType: 'line', value: 1 },
+          { datasource: '1__table', viz_type: VizType.Line },
+          { timeout: 10 },
+        ),
+      ).rejects.toBeDefined();
+    });
+
+    test('rejects when the response does not contain annotation data', () => {
+      fetchMock.post('glob:*/api/v1/chart/data', { result: [{}] });
+
+      return expect(
+        chartClient.loadAnnotation(
+          { name: 'my-annotation', sourceType: 'line', value: 1 },
+          { datasource: '1__table', viz_type: VizType.Line },
+        ),
+      ).rejects.toEqual(
+        new Error('Failed to load annotation data for layer: my-annotation'),
+      );
+    });
   });
 
   describe('.loadAnnotations(annotationLayers)', () => {
@@ -225,6 +328,21 @@ describe('ChartClient', () => {
         anno2: {},
         anno3: {},
       }));
+    test('combines query-backed and query-less layers by name', () => {
+      fetchMock.post('glob:*/api/v1/chart/data', {
+        result: [{ annotation_data: { anno2: { records: [{ y: 2 }] } } }],
+      });
+
+      return expect(
+        chartClient.loadAnnotations(
+          [{ name: 'anno1' }, { name: 'anno2', sourceType: 'line', value: 1 }],
+          { datasource: '1__table', viz_type: VizType.Line },
+        ),
+      ).resolves.toEqual({
+        anno1: {},
+        anno2: { records: [{ y: 2 }] },
+      });
+    });
     test('returns an empty object if input is not an array', () =>
       expect(chartClient.loadAnnotations()).resolves.toEqual({}));
     test('returns an empty object if input is an empty array', () =>
