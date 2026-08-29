@@ -20,4 +20,7 @@
 export type AnnotationLayerMetadata = {
   name: string;
   sourceType?: string;
+  /** id of the chart or native annotation layer backing this layer */
+  value?: number | string;
+  overrides?: { [key: string]: unknown };
 };
