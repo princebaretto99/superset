@@ -272,6 +272,7 @@ flask-appbuilder==5.2.2
 flask-babel==4.0.0
     # via
     #   -c requirements/base-constraint.txt
+    #   apache-superset
     #   flask-appbuilder
 flask-caching==2.4.1
     # via
