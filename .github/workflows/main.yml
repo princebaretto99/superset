@@ -1,0 +1,72 @@
+# Runs the remediation loop against TARGET_REPO.
+#
+# Triggers:
+#   schedule            - every 15 minutes; the main event source
+#   repository_dispatch - a GitHub webhook on the target repo can push here
+#   workflow_dispatch   - manual, and how you do a dry run
+name: Devin Issue Remediation
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  repository_dispatch:
+    types: [issue-event]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Only this issue number (blank = all open issues)"
+        required: false
+        type: string
+      dry_run:
+        description: "Print the Devin API calls instead of making them"
+        required: false
+        default: true
+        type: boolean
+
+# Never let two runs work on the same issue at the same time.
+concurrency:
+  group: devin-remediation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Remediate
+        env:
+          # TARGET_REPO is the repo whose issues get fixed, e.g. princebaretto99/superset
+          TARGET_REPO: ${{ vars.TARGET_REPO }}
+          # A PAT with issues:write on TARGET_REPO. The built-in GITHUB_TOKEN only
+          # works on this repo, so it cannot comment on another one.
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          # Issue numbers arrive as data, never spliced into this shell script.
+          ISSUE: ${{ inputs.issue || github.event.client_payload.issue }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(run --out out)
+          [[ -n "${ISSUE:-}" ]] && args+=(--issue "${ISSUE}")
+          [[ "${DRY_RUN:-false}" == "true" ]] && args+=(--dry-run)
+          python remediate.py "${args[@]}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: run-${{ github.run_id }}
+          path: out/
+          if-no-files-found: warn
