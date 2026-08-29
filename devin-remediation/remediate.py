@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -371,13 +372,23 @@ def advance_session(gh, devin, issue, state, comment_id):
     if state["session_id"] == "dry-run":
         return {"action": "dry-run", "status": state["status"], **summary(issue, state)}
 
+    # Already finished and written up -- nothing left to poll.
+    if state["status"] in TERMINAL and state.get("closed"):
+        return {"action": "settled", "status": state["status"], **summary(issue, state)}
+
     session = devin.session(state["session_id"])
     output = session.get("structured_output") or {}
     state["pr"] = (session.get("pull_request") or {}).get("url") or output.get("pull_request_url") or state.get("pr")
 
     devin_status = session.get("status_enum") or ""
     question = ""
-    if devin_status == "blocked":
+    if devin_status == "blocked" and state["pr"]:
+        # Devin parks a session in "blocked" whenever it is waiting on a human --
+        # including after it has finished the job and opened the PR. A PR on the
+        # table means the work landed, so don't call that blocked and don't
+        # spend ACUs nudging a session that is already done.
+        state["status"] = "finished"
+    elif devin_status == "blocked":
         state["status"] = "blocked"
         question = last_devin_message(session)
         # Nobody is watching -- nudge once, then leave it for a human.
@@ -401,6 +412,13 @@ def advance_session(gh, devin, issue, state, comment_id):
 
     gh.edit_comment(comment_id, render(state, output, question))
     set_label(gh, issue, label_for(state))
+
+    # One closing comment when the work is over, so the issue has a real ending
+    # in its timeline instead of a silently-edited status table.
+    if state["status"] in TERMINAL and not state.get("closed"):
+        gh.add_comment(issue["number"], closure_comment(state, output, session))
+        state["closed"] = True
+        gh.edit_comment(comment_id, render(state, output, question))
 
     action = {
         "finished": "completed" if state["pr"] else "no-pr",
@@ -430,6 +448,80 @@ def set_label(gh, issue, new_label):
     issue["labels"] = [{"name": name} for name in keep]
 
 
+OUTCOME = {
+    "shipped": ("✅ Devin fixed this", "A pull request is ready for review."),
+    "needs_human": ("⚠️ Devin stopped without a fix",
+                    "The session finished but no pull request came out of it."),
+    "failed": ("🔴 Devin did not finish", "The session expired or ran past its time limit."),
+}
+
+
+def outcome_of(state):
+    if state["status"] == "finished":
+        return "shipped" if state["pr"] else "needs_human"
+    return "failed"
+
+
+def transcript(session, limit=8):
+    """The tail of the conversation, so a reader can see how Devin got there."""
+    lines = []
+    for message in (session.get("messages") or [])[-limit:]:
+        text = (message.get("message") or "").strip()
+        if not text:
+            continue
+        who = "**Devin**" if message.get("type") == "devin_message" else "**Prompt**"
+        lines.append(f"{who}: {text[:700]}")
+    return lines
+
+
+def closure_comment(state, output, session):
+    """The final word on an issue: what happened, what changed, and the PR.
+
+    Posted once, as a *new* comment rather than an edit, so it shows up in the
+    timeline and notifies everyone watching the issue. The status table above it
+    keeps being the live view; this is the receipt.
+    """
+    headline, blurb = OUTCOME[outcome_of(state)]
+    took = minutes_since(state["started"])
+    lines = [f"## {headline}", "", blurb, ""]
+
+    if state["pr"]:
+        lines += [f"**Pull request:** {state['pr']}", ""]
+
+    for label, key in [("Root cause", "root_cause"), ("What changed", "fix_summary"),
+                       ("Verification", "tests_run")]:
+        if output.get(key):
+            lines += [f"### {label}", "", str(output[key])[:1500], ""]
+
+    if output.get("files_changed"):
+        lines += ["### Files touched", ""]
+        lines += [f"- `{path}`" for path in output["files_changed"][:20]]
+        lines.append("")
+
+    if output.get("needs_human") and output.get("blocked_reason"):
+        lines += ["> [!IMPORTANT]", f"> Devin flagged this for a human: {output['blocked_reason']}", ""]
+
+    facts = [f"took {fmt_hours(took / 60) or 'unknown'}"]
+    if output.get("confidence"):
+        facts.append(f"confidence `{output['confidence']}`")
+    if state.get("nudged"):
+        facts.append("needed a nudge")
+    lines += [f"_Session [`{state['session_id'][:24]}`]({state['url']}) — " + ", ".join(facts) + "._", ""]
+
+    log = transcript(session)
+    if log:
+        lines += ["<details>", "<summary>🗒️ What Devin did (last few messages)</summary>", ""]
+        lines += [f"{entry}\n" for entry in log]
+        lines += ["</details>", ""]
+
+    if outcome_of(state) == "shipped":
+        lines.append("Review the pull request; merging it will close this issue.")
+    else:
+        lines.append("This one needs a person. Add `devin:skip` to stop the automation retrying it.")
+
+    return "\n".join(lines)
+
+
 def last_devin_message(session):
     for message in reversed(session.get("messages") or []):
         if message.get("type") == "devin_message":
@@ -448,8 +540,12 @@ def summary(issue, state):
     }
 
 
-def run(gh, devin, only_issue=None, branch="main"):
-    """One full pass: advance what is running, start what is not."""
+def run(gh, devin, only_issue=None, branch="main", allow_new=True):
+    """One full pass: advance what is running, start what is not.
+
+    `allow_new=False` advances existing sessions only -- used by the watch loop,
+    so following a session to its end never quietly exceeds the per-run cap.
+    """
     report = {"repo": gh.repo, "at": now(), "dry_run": gh.dry_run, "results": [], "errors": []}
 
     try:
@@ -482,6 +578,8 @@ def run(gh, devin, only_issue=None, branch="main"):
                 result = {"action": "skipped", "status": "", **summary(issue, state or blank())}
             elif state:
                 result = advance_session(gh, devin, issue, state, comment_id)
+            elif not allow_new:
+                result = {"action": "waiting", "status": "", **summary(issue, blank())}
             elif started >= MAX_NEW_PER_RUN or in_flight >= MAX_IN_FLIGHT:
                 result = {"action": "deferred", "status": "", **summary(issue, blank()),
                           "note": "session cap reached; next run will pick it up"}
@@ -809,11 +907,28 @@ def clients(dry_run, need_devin=True):
     return GitHub(token, repo, dry_run), Devin(key, dry_run)
 
 
+def still_running(report):
+    return any(r["status"] in ACTIVE for r in report["results"])
+
+
 def cmd_run(args):
     gh, devin = clients(args.dry_run)
     branch = os.environ.get("BASE_BRANCH") or gh.repo_info().get("default_branch", "main")
     print(f"repo={gh.repo} branch={branch} mode={'dry-run' if args.dry_run else 'live'}", file=sys.stderr)
+
     report = run(gh, devin, only_issue=args.issue, branch=branch)
+
+    # Without this, a run that starts a session ends immediately and the issue
+    # sits on "Queued" until some later run polls it -- which never happens if
+    # the schedule does not fire. Watching keeps one run honest end to end.
+    deadline = time.time() + args.watch
+    while args.watch and not args.dry_run and still_running(report) and time.time() < deadline:
+        remaining = int(deadline - time.time())
+        print(f"watching {sum(1 for r in report['results'] if r['status'] in ACTIVE)} "
+              f"session(s), {remaining}s left", file=sys.stderr)
+        time.sleep(min(args.poll, max(remaining, 1)))
+        report = run(gh, devin, only_issue=args.issue, branch=branch, allow_new=False)
+
     write_outputs(report, args.out)
     return 1 if report["errors"] else 0
 
@@ -881,6 +996,10 @@ def main(argv=None):
     runner.add_argument("--issue", type=int, help="only this issue number")
     runner.add_argument("--dry-run", action="store_true", help="print API calls instead of making them")
     runner.add_argument("--out", default="out", help="where to write report.md and ledger.json")
+    runner.add_argument("--watch", type=int, default=int(os.environ.get("WATCH_SECONDS", "0")),
+                        help="keep polling running sessions for up to N seconds, "
+                             "so one run reaches a conclusion instead of stopping at 'Queued'")
+    runner.add_argument("--poll", type=int, default=30, help="seconds between polls while watching")
     runner.set_defaults(func=cmd_run)
 
     sub.add_parser("doctor", help="check credentials and setup").set_defaults(func=cmd_doctor)

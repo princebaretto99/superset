@@ -8,7 +8,11 @@ name: Devin Issue Remediation
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # Offset off the round-minute marks on purpose: GitHub queues cron jobs on a
+    # best-effort basis and :00/:05/:10 are the most congested slots, so schedules
+    # that land there are the ones most likely to be dropped or delayed.
+    # 12 minutes also leaves room for a run that watches its sessions for 10.
+    - cron: "3,15,27,39,51 * * * *"
   repository_dispatch:
     types: [issue-event]
   workflow_dispatch:
@@ -63,6 +67,10 @@ jobs:
           # Issue numbers arrive as data, never spliced into this shell script.
           ISSUE: ${{ inputs.issue || github.event.client_payload.issue }}
           DRY_RUN: ${{ inputs.dry_run }}
+          # Follow sessions started by this run for up to 10 minutes, so a single
+          # trigger reaches a conclusion (PR + closure comment) instead of leaving
+          # the issue showing "Queued" until some later run happens to poll it.
+          WATCH_SECONDS: "600"
         run: |
           set -euo pipefail
           args=(run --out out)

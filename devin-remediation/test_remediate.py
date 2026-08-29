@@ -148,11 +148,13 @@ def test_a_second_run_does_not_start_a_duplicate_session():
     assert report["results"][0]["action"] == "completed"
     assert report["results"][0]["pr"].endswith("/pull/9")
     assert gh.labels_on(1) == [LABELS["pr"][0]]
-    # One comment, edited in place -- not a new comment each run.
-    assert len(gh.comments(1)) == 1
-    body = gh.comments(1)[0]["body"]
-    assert "off-by-one in the paginator" in body
-    assert "superset/views/base.py" in body
+    # The status comment is edited in place; a closure comment is added once.
+    assert len(gh.comments(1)) == 2
+    status, closure = gh.comments(1)
+    assert "off-by-one in the paginator" in status["body"]
+    assert "superset/views/base.py" in status["body"]
+    assert "✅ Devin fixed this" in closure["body"]
+    assert "/pull/9" in closure["body"]
 
 
 def test_the_pull_request_can_come_from_structured_output_instead():
@@ -510,3 +512,147 @@ def test_stats_does_not_require_a_devin_key(monkeypatch):
 
     gh, _ = remediate.clients(dry_run=False, need_devin=False)
     assert gh.repo == "octo/demo"
+
+
+# -------------------------------------------------------------------- closure
+
+
+def test_a_finished_session_posts_one_closure_comment_with_the_details():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    devin.state["devin-1"] = {
+        "session_id": "devin-1",
+        "status_enum": "finished",
+        "pull_request": {"url": "https://github.com/octo/demo/pull/9"},
+        "structured_output": {
+            "root_cause": "the offset was computed before the filter applied",
+            "fix_summary": "moved the offset calculation after filtering",
+            "files_changed": ["superset/views/base.py"],
+            "tests_run": "pytest tests/unit_tests/views/base_test.py -- 12 passed",
+            "confidence": "high",
+        },
+        "messages": [
+            {"type": "user_message", "message": "Fix this GitHub issue..."},
+            {"type": "devin_message", "message": "Reproduced it -- the paginator drops a row."},
+            {"type": "devin_message", "message": "Opened PR #9 with a regression test."},
+        ],
+    }
+
+    run(gh, devin)
+    closure = gh.comments(1)[1]["body"]
+
+    assert "✅ Devin fixed this" in closure
+    assert "https://github.com/octo/demo/pull/9" in closure
+    assert "the offset was computed before the filter applied" in closure
+    assert "superset/views/base.py" in closure
+    assert "12 passed" in closure
+    assert "confidence `high`" in closure
+    # Devin's own words are included, collapsed.
+    assert "<details>" in closure
+    assert "Opened PR #9 with a regression test." in closure
+    assert "merging it will close this issue" in closure
+
+
+def test_the_closure_comment_is_posted_only_once():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/9")
+
+    run(gh, devin)
+    assert len(gh.comments(1)) == 2
+    run(gh, devin)
+    run(gh, devin)
+    assert len(gh.comments(1)) == 2, "must not repost the closure on later sweeps"
+
+
+def test_a_settled_issue_is_not_polled_again():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/9")
+    run(gh, devin)
+
+    devin.session = lambda sid: (_ for _ in ()).throw(AssertionError("should not poll"))
+    report = run(gh, devin)
+
+    assert report["results"][0]["action"] == "settled"
+
+
+def test_closure_for_a_session_that_produced_no_pr_asks_for_a_person():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    devin.state["devin-1"] = {
+        "session_id": "devin-1",
+        "status_enum": "finished",
+        "structured_output": {"needs_human": True, "blocked_reason": "needs a product decision",
+                              "root_cause": "ambiguous spec", "fix_summary": "none"},
+    }
+
+    run(gh, devin)
+    closure = gh.comments(1)[1]["body"]
+
+    assert "⚠️ Devin stopped without a fix" in closure
+    assert "needs a product decision" in closure
+    assert "devin:skip" in closure
+
+
+def test_a_blocked_session_that_already_opened_a_pr_counts_as_done():
+    """Devin parks a finished session in `blocked` awaiting input. With a PR on
+    the table that is success, not a blocker -- and it must not be nudged."""
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    devin.state["devin-1"] = {
+        "session_id": "devin-1",
+        "status_enum": "blocked",
+        "pull_request": {"url": "https://github.com/octo/demo/pull/9"},
+        "messages": [{"type": "devin_message", "message": "Anything else?"}],
+    }
+
+    report = run(gh, devin)
+
+    assert report["results"][0]["action"] == "completed"
+    assert gh.labels_on(1) == [LABELS["pr"][0]]
+    assert devin.messages == [], "a finished session must not be nudged"
+    assert "✅ Devin fixed this" in gh.comments(1)[1]["body"]
+
+
+def test_a_blocked_session_with_no_pr_is_still_treated_as_blocked():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    devin.state["devin-1"] = {
+        "session_id": "devin-1",
+        "status_enum": "blocked",
+        "messages": [{"type": "devin_message", "message": "Which schema should I migrate?"}],
+    }
+
+    report = run(gh, devin)
+
+    assert report["results"][0]["action"] == "blocked"
+    assert len(devin.messages) == 1, "a genuinely blocked session still gets nudged"
+    assert len(gh.comments(1)) == 1, "no closure comment while it is still running"
+
+
+# ---------------------------------------------------------------- watch mode
+
+
+def test_watching_does_not_start_new_sessions(monkeypatch):
+    """The watch loop must only advance -- otherwise following one session to
+    the end would quietly trickle past MAX_NEW_PER_RUN."""
+    monkeypatch.setattr(remediate, "MAX_NEW_PER_RUN", 1)
+    gh, devin = FakeGitHub(issue(1), issue(2)), FakeDevin()
+
+    run(gh, devin)                                   # dispatches #1, defers #2
+    assert len(devin.created) == 1
+
+    report = run(gh, devin, allow_new=False)         # a watch iteration
+
+    assert len(devin.created) == 1, "watching must not dispatch the deferred issue"
+    assert {r["action"] for r in report["results"]} == {"working", "waiting"}
+
+
+def test_still_running_drives_the_watch_loop():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+
+    assert remediate.still_running(run(gh, devin)) is True     # queued
+
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/9")
+    assert remediate.still_running(run(gh, devin)) is False    # done -> loop exits

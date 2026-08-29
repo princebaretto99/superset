@@ -42,6 +42,16 @@ That comment is the only record the automation keeps, which makes runs safe to
 repeat: a re-run, a duplicate webhook, or a run that died half-way all land in the
 same place, and a session is never started twice for the same issue.
 
+**Closure.** When a session ends, the automation posts a second, final comment —
+outcome, root cause, what changed, files touched, tests run, the PR link, and a
+collapsed transcript of Devin's own messages. It's a real timeline event that
+notifies watchers, rather than a silent edit to the status table above it.
+
+**Watching.** A run that starts a session keeps polling it (`--watch`, 10 min in
+the workflow) so a single trigger reaches a conclusion. Without this the issue
+sits on `Queued` until some later run polls it — and if the schedule doesn't
+fire, that never happens.
+
 **Lifecycle:**
 
 ```
@@ -184,5 +194,5 @@ Anything over the cap is reported as `deferred` and picked up next run.
 python -m pytest
 ```
 
-33 tests, no network and no ACUs. `test_integration.py` runs a stub HTTP server
+43 tests, no network and no ACUs. `test_integration.py` runs a stub HTTP server
 that speaks both APIs, so the real client code is exercised too.

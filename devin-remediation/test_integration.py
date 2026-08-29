@@ -176,12 +176,13 @@ def test_full_cycle_over_real_http(server):
     assert second["results"][0]["pr"].endswith("/pull/7")
     assert [l["name"] for l in server.issues[1]["labels"]] == ["bug", "devin:pr-open"]
 
-    # One comment, edited in place, carrying the results and the state marker.
-    assert len(server.comments[1]) == 1
+    # Status comment edited in place, plus one closure comment at the end.
+    assert len(server.comments[1]) == 2
     body = server.comments[1][0]["body"]
     assert "the axis width is computed before the font loads" in body
     assert "src/Legend.tsx" in body
     assert f"https://github.com/{REPO}/pull/7" in body
+    assert "✅ Devin fixed this" in server.comments[1][1]["body"]
     state, comment_id = remediate.read_state(server.comments[1])
     assert state["status"] == "finished"
     assert comment_id == 501
