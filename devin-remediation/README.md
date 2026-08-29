@@ -7,18 +7,19 @@ those sessions until they finish, and reports back on the issue as a pull reques
 ```
  trigger              one run does both               observable output
 ┌──────────────┐    ┌────────────────────────┐    ┌────────────────────────┐
-│ schedule     │    │ advance running        │    │ comment on the issue   │
-│ webhook      │──▶ │   sessions             │──▶ │ devin:* labels         │
-│ manual       │    │ start sessions for     │    │ pull request           │
-└──────────────┘    │   issues without one   │    │ report.md + ledger.json│
-                    └────────────────────────┘    └────────────────────────┘
+│ schedule     │    │ advance running        │    │ comment on the issue    │
+│ webhook      │──▶ │   sessions             │──▶ │ devin:* labels          │
+│ manual       │    │ start sessions for     │    │ pull request            │
+└──────────────┘    │   issues without one   │    │ report.md + ledger.json │
+                    └────────────────────────┘    │ stats.md  + stats.json  │
+                                                  └────────────────────────┘
 ```
 
 ## The files
 
 | File | What it is |
 |---|---|
-| `remediate.py` | The whole automation: both API clients, the loop, the report. |
+| `remediate.py` | The whole automation: both API clients, the loop, the report, the stats dashboard. |
 | `webhook.py` | Optional receiver so a GitHub webhook can trigger a run instantly. |
 | `.github/workflows/devin-remediate.yml` | Runs it every 15 minutes in GitHub Actions. |
 | `test_remediate.py` | Unit tests over the loop, with fake API clients. |
@@ -95,6 +96,38 @@ python remediate.py run --issue 4     # one issue, live
 python remediate.py run               # everything, live
 ```
 
+## Is it working? — `stats`
+
+```bash
+python remediate.py stats             # markdown dashboard
+python remediate.py stats --json      # same numbers, machine-readable
+```
+
+This is the answer to *"if I were an engineering leader, how would I know this is
+working?"*. It reads every issue in the repo — **open and closed** — plus the state
+markers, and reports:
+
+| Section | Answers |
+|---|---|
+| **Is it working?** | How many issues were picked up, how many produced a PR, how many were handed back to a human, how many failed, how many are in flight right now |
+| **Speed** | Median time from issue opened → session started, and session started → PR |
+| **Throughput** | Sessions started and PRs opened in the last 24h and 7d |
+| **Pipeline** | Live count at each stage |
+| **Every issue** | One row per issue: stage, session link, PR link, pickup time, duration |
+
+The headline numbers are **success rate** (PRs ÷ completed sessions), **escalation
+rate** (needed a human), and **failure rate**. An issue that was closed after its
+PR landed is counted separately as `closed_with_pr` — the strongest signal the
+system actually resolved something.
+
+Every number is derived from GitHub itself, so there is no metrics database to
+keep in sync, nothing to back up, and the figures stay correct after a lost
+artifact or a re-run. `stats.json` is written alongside `stats.md` for anything
+downstream.
+
+The workflow runs `stats` on **every** run (with `if: always()`, so a failed run
+still publishes its dashboard) and appends it to the Actions job summary.
+
 ### In GitHub Actions
 
 Push this folder to its own repo, then set:
@@ -151,5 +184,5 @@ Anything over the cap is reported as `deferred` and picked up next run.
 python -m pytest
 ```
 
-21 tests, no network and no ACUs. `test_integration.py` runs a stub HTTP server
+33 tests, no network and no ACUs. `test_integration.py` runs a stub HTTP server
 that speaks both APIs, so the real client code is exercised too.

@@ -30,6 +30,8 @@ class Store:
                 "labels": [{"name": "bug"}],
                 "state": "open",
                 "html_url": f"https://github.com/{REPO}/issues/1",
+                "created_at": "2026-08-28T09:00:00Z",
+                "closed_at": None,
             }
         }
         self.comments = {1: []}
@@ -60,6 +62,13 @@ class Stub(BaseHTTPRequestHandler):
             return self._send(200, {"full_name": REPO, "has_issues": True, "default_branch": "main"})
         if path.startswith("/api/repos/octo/demo/labels/"):
             return self._send(404, {"message": "Not Found"})
+        if path == "/api/repos/octo/demo/issues/comments":
+            # Repo-wide comment listing, as GitHub returns it for analytics.
+            return self._send(200, [
+                {**comment, "issue_url": f"https://api.github.com/repos/{REPO}/issues/{number}"}
+                for number, comments in store.comments.items()
+                for comment in comments
+            ])
         if path == "/api/repos/octo/demo/issues":
             # The client paginates; one short page ends it.
             return self._send(200, list(store.issues.values()))
@@ -194,3 +203,32 @@ def test_api_errors_are_reported_not_swallowed(server):
 
     with pytest.raises(RuntimeError, match="404"):
         gh.repo_info()
+
+
+def test_stats_dashboard_over_real_http(server):
+    """`stats` must work through the real client, including the bulk comment fetch."""
+    gh = remediate.GitHub("ghs_token", REPO)
+    devin = remediate.Devin("apk_key")
+
+    remediate.run(gh, devin, branch="main")
+    server.sessions["devin-1"] = {
+        "session_id": "devin-1",
+        "status_enum": "finished",
+        "pull_request": {"url": f"https://github.com/{REPO}/pull/7"},
+        "structured_output": {"confidence": "high", "needs_human": False},
+    }
+    remediate.run(gh, devin, branch="main")
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["repo"] == REPO
+    assert stats["totals"]["attempted"] == 1
+    assert stats["totals"]["shipped"] == 1
+    assert stats["rates"]["success_pct"] == 100.0
+    assert stats["stages"]["shipped"] == 1
+    # Pickup is measured from the issue's real created_at.
+    assert stats["issues"][0]["pickup_hours"] is not None
+
+    markdown = remediate.stats_markdown(stats)
+    assert "Produced a PR" in markdown
+    assert f"https://github.com/{REPO}/pull/7" in markdown

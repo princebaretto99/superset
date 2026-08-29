@@ -70,6 +70,15 @@ jobs:
           [[ "${DRY_RUN:-false}" == "true" ]] && args+=(--dry-run)
           python remediate.py "${args[@]}"
 
+      # Effectiveness dashboard: outcomes, success rate, speed, throughput.
+      # Runs even when the step above failed, so a bad run is still visible.
+      - name: Report
+        if: always()
+        env:
+          TARGET_REPO: ${{ vars.TARGET_REPO || github.repository }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python remediate.py stats --out out
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

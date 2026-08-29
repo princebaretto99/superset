@@ -17,6 +17,8 @@ def issue(number=1, title="Something is broken", labels=(), body="It breaks."):
         "labels": [{"name": name} for name in labels],
         "state": "open",
         "html_url": f"https://github.com/octo/demo/issues/{number}",
+        "created_at": "2026-08-29T09:00:00Z",
+        "closed_at": None,
     }
 
 
@@ -34,6 +36,12 @@ class FakeGitHub:
 
     def open_issues(self):
         return list(self.issues.values())
+
+    def list_issues(self, state="open"):
+        return [i for i in self.issues.values() if state == "all" or i["state"] == state]
+
+    def all_comments(self):
+        return dict(self._comments)
 
     def issue(self, number):
         return self.issues[number]
@@ -324,3 +332,181 @@ def test_webhook_refuses_to_run_without_a_secret(monkeypatch):
 
     monkeypatch.setattr(webhook, "SECRET", "")
     assert webhook.signature_ok(b"anything", "sha256=whatever") is False
+
+
+# ------------------------------------------------------------------ analytics
+
+
+def finish(devin, session_id="devin-1", pr=None, status="finished"):
+    """Put a session into a terminal state, with or without a PR."""
+    devin.state[session_id] = {
+        "session_id": session_id,
+        "status_enum": status,
+        **({"pull_request": {"url": pr}} if pr else {}),
+    }
+
+
+def test_stats_counts_outcomes_and_computes_a_success_rate():
+    gh, devin = FakeGitHub(issue(1), issue(2), issue(3)), FakeDevin()
+    run(gh, devin)                                   # three sessions started
+
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/1")   # shipped
+    finish(devin, "devin-2")                                            # no PR
+    finish(devin, "devin-3", status="expired")                          # failed
+    run(gh, devin)
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["totals"]["attempted"] == 3
+    assert stats["totals"]["completed"] == 3
+    assert stats["totals"]["shipped"] == 1
+    assert stats["totals"]["escalated"] == 1
+    assert stats["totals"]["failed"] == 1
+    assert stats["rates"]["success_pct"] == 33.3
+    assert stats["rates"]["escalation_pct"] == 33.3
+    assert stats["rates"]["failure_pct"] == 33.3
+    assert stats["totals"]["active"] == 0
+
+
+def test_stats_separates_active_work_from_finished_work():
+    gh, devin = FakeGitHub(issue(1), issue(2)), FakeDevin()
+    run(gh, devin)
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/1")
+    run(gh, devin)                                   # devin-2 still "working"
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["totals"]["active"] == 1
+    assert stats["totals"]["completed"] == 1
+    assert stats["stages"]["working"] == 1
+    assert stats["stages"]["shipped"] == 1
+
+
+def test_stats_reports_coverage_and_ignores_skipped_issues():
+    gh, devin = FakeGitHub(issue(1), issue(2, labels=[SKIP_LABEL]), issue(3)), FakeDevin()
+    run(gh, devin)
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["totals"]["issues"] == 3
+    assert stats["totals"]["eligible"] == 2          # the skipped one does not count
+    assert stats["totals"]["attempted"] == 2
+    assert stats["rates"]["coverage_pct"] == 100.0
+    assert stats["stages"]["skipped"] == 1
+
+
+def test_stats_counts_issues_that_were_never_picked_up(monkeypatch):
+    monkeypatch.setattr(remediate, "MAX_NEW_PER_RUN", 1)
+    gh, devin = FakeGitHub(issue(1), issue(2), issue(3)), FakeDevin()
+    run(gh, devin)
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["stages"]["not_started"] == 2
+    assert stats["rates"]["coverage_pct"] == 33.3    # 1 of 3 eligible
+
+
+def test_stats_measures_how_long_sessions_took():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+
+    # Backdate the session so there is a measurable duration.
+    state, comment_id = remediate.read_state(gh.comments(1))
+    state["started"] = "2026-08-28T10:00:00+00:00"
+    gh.edit_comment(comment_id, remediate.render(state))
+    gh.issues[1]["created_at"] = "2026-08-28T09:00:00+00:00"
+
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/1")
+    run(gh, devin)
+
+    stats = remediate.collect_stats(gh)
+    row = stats["issues"][0]
+
+    assert row["pickup_hours"] == pytest.approx(1.0)  # 09:00 -> 10:00
+    assert row["resolution_hours"] > 0
+    assert stats["speed_hours"]["median_pickup"] == pytest.approx(1.0)
+    assert stats["throughput"]["shipped_24h"] >= 0
+
+
+def test_stats_tracks_issues_closed_after_a_pr_landed():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/1")
+    run(gh, devin)
+
+    gh.issues[1]["state"] = "closed"                 # a human merged and closed it
+    stats = remediate.collect_stats(gh)
+
+    assert stats["totals"]["closed_with_pr"] == 1
+
+
+def test_stats_notes_when_devin_needed_nudging():
+    gh, devin = FakeGitHub(issue(1)), FakeDevin()
+    run(gh, devin)
+    devin.state["devin-1"] = {"session_id": "devin-1", "status_enum": "blocked"}
+    run(gh, devin)
+
+    stats = remediate.collect_stats(gh)
+
+    assert stats["rates"]["blocked_pct"] == 100.0
+    assert stats["stages"]["blocked"] == 1
+
+
+def test_stats_on_an_empty_repo_does_not_divide_by_zero():
+    stats = remediate.collect_stats(FakeGitHub())
+
+    assert stats["totals"]["issues"] == 0
+    assert stats["rates"]["success_pct"] is None
+    assert stats["speed_hours"]["median_pickup"] is None
+    assert "Devin remediation" in remediate.stats_markdown(stats)
+
+
+def test_stats_markdown_shows_the_headline_numbers():
+    gh, devin = FakeGitHub(issue(1, title="Legend overlaps")), FakeDevin()
+    run(gh, devin)
+    finish(devin, "devin-1", pr="https://github.com/octo/demo/pull/4")
+    run(gh, devin)
+
+    markdown = remediate.stats_markdown(remediate.collect_stats(gh))
+
+    assert "Produced a PR" in markdown
+    assert "100.0%" in markdown
+    assert "Legend overlaps" in markdown
+    assert "/pull/4" in markdown
+    assert "Throughput" in markdown
+
+
+def test_duration_formatting_is_human_readable():
+    assert remediate.fmt_hours(0.5) == "30m"
+    assert remediate.fmt_hours(3.25) == "3.2h"
+    assert remediate.fmt_hours(72) == "3.0d"
+    assert remediate.fmt_hours(None) is None
+
+
+def test_median_handles_even_odd_and_empty():
+    assert remediate.median([3, 1, 2]) == 2
+    assert remediate.median([1, 2, 3, 4]) == 2.5
+    assert remediate.median([]) is None
+    assert remediate.median([None, 5]) == 5
+
+
+def test_stats_refuses_to_run_without_a_github_token(monkeypatch):
+    """Unauthenticated stats would report zeros and look like 'nothing happened'.
+    It must fail loudly instead, so a missing secret is obvious in the CI log."""
+    monkeypatch.setenv("TARGET_REPO", "octo/demo")
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit) as exit_info:
+        remediate.clients(dry_run=False, need_devin=False)
+    assert "GH_TOKEN" in str(exit_info.value)
+
+
+def test_stats_does_not_require_a_devin_key(monkeypatch):
+    """`stats` only reads GitHub, so it must work in a job with no Devin key."""
+    monkeypatch.setenv("TARGET_REPO", "octo/demo")
+    monkeypatch.setenv("GH_TOKEN", "ghs_x")
+    monkeypatch.delenv("DEVIN_API_KEY", raising=False)
+
+    gh, _ = remediate.clients(dry_run=False, need_devin=False)
+    assert gh.repo == "octo/demo"

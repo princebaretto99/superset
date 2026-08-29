@@ -11,6 +11,7 @@ on that issue -- so a run can be repeated safely and never starts a duplicate.
     python remediate.py doctor
     python remediate.py run --dry-run
     python remediate.py run --issue 4
+    python remediate.py stats
 """
 
 from __future__ import annotations
@@ -49,6 +50,12 @@ LABELS = {
 }
 OUR_LABELS = {name for name, _ in LABELS.values()}
 SKIP_LABEL = LABELS["skip"][0]
+
+# A session in one of these states is done; anything else is still in flight.
+TERMINAL = ("finished", "failed")
+ACTIVE = ("queued", "working", "blocked")
+# Analytics splits "finished" by whether a PR came out of it.
+DONE_STAGES = ("shipped", "needs_human", "failed")
 
 MARKER_RE = re.compile(r"<!-- devin-state (?P<json>\{.*?\}) -->", re.DOTALL)
 
@@ -152,9 +159,13 @@ class GitHub:
 
     def open_issues(self):
         """Open issues, newest last. Pull requests are not issues here."""
+        return self.list_issues(state="open")
+
+    def list_issues(self, state="open"):
+        """Issues in the given state ("open", "closed" or "all"), PRs excluded."""
         out, page = [], 1
         while True:
-            batch = self._call("GET", "/issues", params={"state": "open", "per_page": 100, "page": page})
+            batch = self._call("GET", "/issues", params={"state": state, "per_page": 100, "page": page})
             out += [i for i in batch if "pull_request" not in i]
             if len(batch) < 100:
                 return out
@@ -165,6 +176,22 @@ class GitHub:
 
     def comments(self, number):
         return self._call("GET", f"/issues/{number}/comments", params={"per_page": 100})
+
+    def all_comments(self):
+        """Every issue comment in the repo, grouped by issue number.
+
+        Analytics needs the state marker from every issue at once; this is one
+        call per 100 comments instead of one call per issue.
+        """
+        grouped, page = {}, 1
+        while True:
+            batch = self._call("GET", "/issues/comments", params={"per_page": 100, "page": page})
+            for comment in batch:
+                number = int(comment["issue_url"].rsplit("/", 1)[1])
+                grouped.setdefault(number, []).append(comment)
+            if len(batch) < 100:
+                return grouped
+            page += 1
 
     def add_comment(self, number, body):
         if self.dry_run:
@@ -329,6 +356,7 @@ def start_session(gh, devin, issue, branch):
         "session_id": created["session_id"],
         "url": created.get("url", ""),
         "started": now(),
+        "finished": None,          # set once the session reaches a terminal state
         "status": "queued",
         "nudged": False,
         "pr": None,
@@ -366,6 +394,10 @@ def advance_session(gh, devin, issue, state, comment_id):
     # A session that never ends would hold an in-flight slot forever.
     if state["status"] in ("working", "queued") and minutes_since(state["started"]) > TIMEOUT_MINUTES:
         state["status"] = "failed"
+
+    # Stamp the moment it stopped, so `stats` can measure how long it took.
+    if state["status"] in TERMINAL and not state.get("finished"):
+        state["finished"] = now()
 
     gh.edit_comment(comment_id, render(state, output, question))
     set_label(gh, issue, label_for(state))
@@ -531,11 +563,240 @@ def write_outputs(report, out_dir):
 
 
 # --------------------------------------------------------------------------- #
+# Analytics.
+#
+# Everything below is *derived* from GitHub -- the issues, their labels, and the
+# state markers in the bot comments. There is no separate metrics store to keep
+# in sync, nothing to back up, and the numbers are still correct after a lost
+# artifact or a re-run. Closed issues are included on purpose: an issue closed
+# after its PR merged is the strongest success signal the system has.
+# --------------------------------------------------------------------------- #
+
+
+def parse_time(stamp):
+    try:
+        return datetime.fromisoformat((stamp or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def hours_between(start, end):
+    first, second = parse_time(start), parse_time(end)
+    return (second - first).total_seconds() / 3600 if first and second else None
+
+
+def median(values):
+    ordered = sorted(v for v in values if v is not None)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def collect_stats(gh):
+    """Rebuild the whole pipeline from the repo. Returns rows plus aggregates."""
+    comments_by_issue = gh.all_comments()
+    rows = []
+
+    for issue in gh.list_issues(state="all"):
+        labels = [label["name"] for label in issue["labels"]]
+        state, _ = read_state(comments_by_issue.get(issue["number"], []))
+
+        if state:
+            stage = state["status"]
+            # "finished" alone hides the thing that matters: did it produce a PR?
+            if stage == "finished":
+                stage = "shipped" if state.get("pr") else "needs_human"
+        elif SKIP_LABEL in labels:
+            stage = "skipped"
+        else:
+            stage = "not_started"
+
+        rows.append({
+            "issue": issue["number"],
+            "title": issue["title"],
+            "issue_url": issue["html_url"],
+            "issue_state": issue["state"],
+            "opened_at": issue.get("created_at"),
+            "closed_at": issue.get("closed_at"),
+            "stage": stage,
+            "session_id": (state or {}).get("session_id", ""),
+            "session_url": (state or {}).get("url", ""),
+            "pr": (state or {}).get("pr"),
+            "nudged": bool((state or {}).get("nudged")),
+            "started": (state or {}).get("started"),
+            "finished": (state or {}).get("finished"),
+            # How long the issue waited before the system picked it up.
+            "pickup_hours": hours_between(issue.get("created_at"), (state or {}).get("started")),
+            # How long Devin took once it started.
+            "resolution_hours": hours_between((state or {}).get("started"), (state or {}).get("finished")),
+        })
+
+    return {"repo": gh.repo, "at": now(), "issues": rows, **summarise(rows)}
+
+
+def summarise(rows):
+    """Turn per-issue rows into the numbers a lead actually asks about."""
+    stages = {}
+    for row in rows:
+        stages[row["stage"]] = stages.get(row["stage"], 0) + 1
+
+    considered = [r for r in rows if r["stage"] != "skipped"]
+    attempted = [r for r in rows if r["session_id"]]
+    done = [r for r in attempted if r["stage"] in DONE_STAGES]
+
+    shipped = [r for r in done if r["stage"] == "shipped"]
+    escalated = [r for r in done if r["stage"] == "needs_human"]
+    failed = [r for r in done if r["stage"] == "failed"]
+
+    def rate(part, whole):
+        return round(100 * len(part) / len(whole), 1) if whole else None
+
+    return {
+        "stages": stages,
+        "totals": {
+            "issues": len(rows),
+            "eligible": len(considered),
+            "attempted": len(attempted),
+            "active": sum(1 for r in attempted if r["stage"] in ACTIVE),
+            "completed": len(done),
+            "shipped": len(shipped),
+            "escalated": len(escalated),
+            "failed": len(failed),
+            "closed_with_pr": sum(1 for r in shipped if r["issue_state"] == "closed"),
+        },
+        "rates": {
+            # Of the issues we were allowed to touch, how many did we even start?
+            "coverage_pct": rate(attempted, considered),
+            # Of the sessions that ran to completion, how many produced a PR?
+            "success_pct": rate(shipped, done),
+            "escalation_pct": rate(escalated, done),
+            "failure_pct": rate(failed, done),
+            # How often Devin got stuck and needed prodding.
+            "blocked_pct": rate([r for r in attempted if r["nudged"]], attempted),
+        },
+        "speed_hours": {
+            "median_pickup": median([r["pickup_hours"] for r in attempted]),
+            "median_resolution": median([r["resolution_hours"] for r in done]),
+            "median_to_pr": median([r["resolution_hours"] for r in shipped]),
+        },
+        "throughput": {
+            "started_24h": count_within(attempted, "started", 24),
+            "started_7d": count_within(attempted, "started", 24 * 7),
+            "shipped_24h": count_within(shipped, "finished", 24),
+            "shipped_7d": count_within(shipped, "finished", 24 * 7),
+        },
+    }
+
+
+def count_within(rows, field, hours):
+    cutoff = datetime.now(timezone.utc)
+    return sum(
+        1
+        for row in rows
+        if (stamp := parse_time(row.get(field))) and (cutoff - stamp).total_seconds() / 3600 <= hours
+    )
+
+
+STAGE_LABEL = {
+    "queued": "🟡 Queued",
+    "working": "🔵 Working",
+    "blocked": "🟠 Blocked",
+    "shipped": "✅ PR opened",
+    "needs_human": "⚠️ Needs human",
+    "failed": "🔴 Failed",
+    "skipped": "⚪ Skipped",
+    "not_started": "⬜ Not started",
+}
+
+
+def show(value, suffix=""):
+    return "—" if value is None else f"{value}{suffix}"
+
+
+def stats_markdown(stats):
+    totals, rates, speed, flow = (
+        stats["totals"], stats["rates"], stats["speed_hours"], stats["throughput"],
+    )
+
+    lines = [
+        "# 📊 Devin remediation — effectiveness",
+        "",
+        f"**Repo:** `{stats['repo']}` · **As of:** {stats['at']}",
+        "",
+        "## Is it working?",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| **Issues picked up** | {totals['attempted']} of {totals['eligible']} eligible "
+        f"({show(rates['coverage_pct'], '%')}) |",
+        f"| **Sessions completed** | {totals['completed']} |",
+        f"| **✅ Produced a PR** | {totals['shipped']} ({show(rates['success_pct'], '%')} of completed) |",
+        f"| **⚠️ Handed to a human** | {totals['escalated']} ({show(rates['escalation_pct'], '%')}) |",
+        f"| **🔴 Failed / expired** | {totals['failed']} ({show(rates['failure_pct'], '%')}) |",
+        f"| **🏁 Issues closed with a PR** | {totals['closed_with_pr']} |",
+        f"| **🔄 In flight right now** | {totals['active']} |",
+        "",
+        "## Speed",
+        "",
+        "| | Median |",
+        "|---|---|",
+        f"| Issue opened → session started | {show(fmt_hours(speed['median_pickup']))} |",
+        f"| Session started → finished | {show(fmt_hours(speed['median_resolution']))} |",
+        f"| Session started → PR opened | {show(fmt_hours(speed['median_to_pr']))} |",
+        "",
+        "## Throughput",
+        "",
+        "| | Last 24h | Last 7d |",
+        "|---|---|---|",
+        f"| Sessions started | {flow['started_24h']} | {flow['started_7d']} |",
+        f"| PRs opened | {flow['shipped_24h']} | {flow['shipped_7d']} |",
+        "",
+        "## Pipeline",
+        "",
+        "| Stage | Count |",
+        "|---|---|",
+    ]
+    for stage, count in sorted(stats["stages"].items(), key=lambda item: -item[1]):
+        lines.append(f"| {STAGE_LABEL.get(stage, stage)} | {count} |")
+
+    if rates["blocked_pct"]:
+        lines += ["", f"_Devin needed a nudge on {rates['blocked_pct']}% of sessions._"]
+
+    lines += ["", "## Every issue", "",
+              "| Issue | Stage | Session | PR | Pickup | Duration |", "|---|---|---|---|---|---|"]
+    for row in sorted(stats["issues"], key=lambda r: -r["issue"]):
+        session = (f"[`{row['session_id'][:16]}`]({row['session_url']})"
+                   if row["session_url"] else "—")
+        lines.append(
+            f"| [#{row['issue']}]({row['issue_url']}) {row['title'][:45]} "
+            f"| {STAGE_LABEL.get(row['stage'], row['stage'])} | {session} "
+            f"| {row['pr'] or '—'} | {show(fmt_hours(row['pickup_hours']))} "
+            f"| {show(fmt_hours(row['resolution_hours']))} |"
+        )
+
+    return "\n".join(lines)
+
+
+def fmt_hours(value):
+    if value is None:
+        return None
+    minutes = value * 60
+    if minutes < 60:
+        return f"{round(minutes)}m"
+    if value < 48:
+        return f"{value:.1f}h"
+    return f"{value / 24:.1f}d"
+
+
+# --------------------------------------------------------------------------- #
 # Entry points.
 # --------------------------------------------------------------------------- #
 
 
-def clients(dry_run):
+def clients(dry_run, need_devin=True):
     repo = os.environ.get("TARGET_REPO") or os.environ.get("GITHUB_REPOSITORY", "")
     if "/" not in repo:
         sys.exit("Set TARGET_REPO to 'owner/repo'.")
@@ -543,7 +804,7 @@ def clients(dry_run):
     key = os.environ.get("DEVIN_API_KEY", "")
     if not token and not dry_run:
         sys.exit("Set GH_TOKEN to a GitHub token with issues:write on the target repo.")
-    if not key and not dry_run:
+    if not key and not dry_run and need_devin:
         sys.exit("Set DEVIN_API_KEY to your Devin API key (apk_...).")
     return GitHub(token, repo, dry_run), Devin(key, dry_run)
 
@@ -555,6 +816,30 @@ def cmd_run(args):
     report = run(gh, devin, only_issue=args.issue, branch=branch)
     write_outputs(report, args.out)
     return 1 if report["errors"] else 0
+
+
+def cmd_stats(args):
+    """Print the effectiveness dashboard, derived entirely from the repo."""
+    gh, _ = clients(dry_run=False, need_devin=False)
+    stats = collect_stats(gh)
+
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "stats.json"), "w") as handle:
+        json.dump(stats, handle, indent=2)
+
+    if args.json:
+        print(json.dumps(stats, indent=2))
+        return 0
+
+    markdown = stats_markdown(stats)
+    with open(os.path.join(args.out, "stats.md"), "w") as handle:
+        handle.write(markdown)
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_file:
+        with open(summary_file, "a") as handle:
+            handle.write(markdown + "\n")
+    print(markdown)
+    return 0
 
 
 def cmd_doctor(_args):
@@ -599,6 +884,11 @@ def main(argv=None):
     runner.set_defaults(func=cmd_run)
 
     sub.add_parser("doctor", help="check credentials and setup").set_defaults(func=cmd_doctor)
+
+    stats = sub.add_parser("stats", help="effectiveness dashboard: outcomes, speed, throughput")
+    stats.add_argument("--json", action="store_true", help="emit raw JSON instead of markdown")
+    stats.add_argument("--out", default="out", help="where to write stats.md and stats.json")
+    stats.set_defaults(func=cmd_stats)
 
     args = parser.parse_args(argv)
     return args.func(args)
