@@ -369,6 +369,64 @@ def test_validate_session_guest_user_creates_valid_token(async_query_manager):
         assert channel  # valid UUID string
 
 
+def test_validate_session_marks_response_as_varying_on_cookie(async_query_manager):
+    """
+    Regression for GHSA-68rp-wp8r-4726 / CVE-2026-27205: the handler inspects
+    the session with membership checks only when the token is already valid,
+    and such a response must still advertise ``Vary: Cookie`` so a shared
+    cache cannot serve it to another session.
+    """
+    from flask import Flask
+
+    async_query_manager._jwt_cookie_secure = False
+    async_query_manager._jwt_cookie_domain = None
+    async_query_manager._jwt_cookie_samesite = "Lax"
+
+    app = Flask(__name__)
+    app.secret_key = "test_secret_key_for_testing"  # noqa: S105
+    async_query_manager.register_request_handlers(app)
+
+    @app.route("/test")
+    def test_view():
+        return "ok"
+
+    client = app.test_client()
+    with client.session_transaction() as flask_session:
+        flask_session["async_channel_id"] = "test_channel_id"
+        flask_session["async_user_id"] = 7
+    client.set_cookie(JWT_TOKEN_COOKIE_NAME, "existing_token")
+
+    with mock.patch(
+        "superset.async_events.async_query_manager.get_user_id",
+        return_value=7,
+    ):
+        resp = client.get("/test")
+
+    assert "cookie" in resp.headers.get("Vary", "").lower()
+
+
+def test_session_membership_check_marks_response_as_varying_on_cookie():
+    """
+    Regression for GHSA-68rp-wp8r-4726 / CVE-2026-27205: Flask releases before
+    3.1.3 do not mark the session as accessed for ``in`` checks, so a response
+    of a view that only tests session membership, as ``validate_session`` does,
+    lacks ``Vary: Cookie`` and can be reused by a shared cache across sessions.
+    """
+    from flask import Flask, session
+
+    app = Flask(__name__)
+    app.secret_key = "test_secret_key_for_testing"  # noqa: S105
+
+    @app.route("/test")
+    def test_view():
+        assert "async_channel_id" not in session
+        return "ok"
+
+    resp = app.test_client().get("/test")
+
+    assert "cookie" in resp.headers.get("Vary", "").lower()
+
+
 @fixture
 def cancellable_manager():
     """A manager wired to a mock Redis backend for cancellation tests."""
